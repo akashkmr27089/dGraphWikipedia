@@ -13,22 +13,28 @@ import (
 //3. Keep Recursing
 
 type DGraphSvc struct {
-	client *dgraph.DGraphClient
-	cache  map[string]string
+	client     *dgraph.DGraphClient
+	cache      map[string]string
+	countCache map[string]int
 }
 
 func New(client *dgraph.DGraphClient) *DGraphSvc {
 	mapSet := make(map[string]string)
+	mapSet2 := make(map[string]int)
+
 	return &DGraphSvc{
-		client: client,
-		cache:  mapSet,
+		client:     client,
+		cache:      mapSet,
+		countCache: mapSet2,
 	}
 }
 
-func (d *DGraphSvc) GetParentInfo(ctx context.Context, name string) (*string, error) {
+func (d *DGraphSvc) GetParentInfo(ctx context.Context, name string) (*int, *string, error) {
 	a, ok := d.cache[name]
 	if ok {
-		return &a, nil
+		d.countCache[name] += 1
+		b, _ := d.countCache[name]
+		return &b, &a, nil
 	}
 
 	q := `query all($a: string) {
@@ -41,7 +47,7 @@ func (d *DGraphSvc) GetParentInfo(ctx context.Context, name string) (*string, er
 	d.client.CreateTxn()
 	resp, err := d.client.QueryWithVars(ctx, q, map[string]string{"$a": name})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	data := resp.Json
@@ -52,18 +58,20 @@ func (d *DGraphSvc) GetParentInfo(ctx context.Context, name string) (*string, er
 
 	err = json.Unmarshal(data, &dataPipe)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if len(dataPipe.All) == 0 {
-		return nil, errors.New("No Data Found")
+		return nil, nil, errors.New("No Data Found")
 	}
 
 	//defer d.client.Close()
 	parentKey := dataPipe.All[0].Uid
+	parentRefCount := dataPipe.All[0].ReferenceCount
 	d.cache[name] = parentKey
+	d.countCache[name] = parentRefCount
 
-	return &parentKey, nil
+	return &parentRefCount, &parentKey, nil
 }
 
 func (d *DGraphSvc) CreateParentNode(ctx context.Context, parentNodeNames string) error {
@@ -79,15 +87,34 @@ func (d *DGraphSvc) CreateParentNode(ctx context.Context, parentNodeNames string
 	return nil
 }
 
+func (d *DGraphSvc) UpdateReferenceCount(ctx context.Context, parentUid *string, parentCount *int) error {
+	data := models.Node{
+		Uid:            *parentUid,
+		ReferenceCount: *parentCount + 1,
+	}
+
+	d.client.CreateTxn()
+	_, err := d.client.Mutate(ctx, data)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (d *DGraphSvc) CreateNodeWithParentConnection(ctx context.Context, childNode *models.Node, parentNodeName string) error {
-	var parentUidInfo *string
-	parentUidInfo, err := d.GetParentInfo(ctx, parentNodeName)
+	var (
+		parentUidInfo *string
+		parentCount   *int
+	)
+
+	parentCount, parentUidInfo, err := d.GetParentInfo(ctx, parentNodeName)
 	if err != nil && parentUidInfo == nil {
 		err := d.CreateParentNode(ctx, parentNodeName)
 		if err != nil {
 			return err
 		}
-		parentUidInfo, err = d.GetParentInfo(ctx, parentNodeName)
+		parentCount, parentUidInfo, err = d.GetParentInfo(ctx, parentNodeName)
 	}
 	if err != nil {
 		return err
@@ -99,6 +126,12 @@ func (d *DGraphSvc) CreateNodeWithParentConnection(ctx context.Context, childNod
 
 	d.client.CreateTxn()
 	_, err = d.client.Mutate(ctx, childNode)
+	if err != nil {
+		return err
+	}
+
+	// Increase Parent Count
+	err = d.UpdateReferenceCount(ctx, parentUidInfo, parentCount)
 	if err != nil {
 		return err
 	}
